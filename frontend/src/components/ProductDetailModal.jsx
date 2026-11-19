@@ -38,6 +38,16 @@ const css = `
   .pdm-tag { font-size: .74rem; padding: 3px 9px; border-radius: 12px; font-weight: 600; }
   .pdm-tag.praise { background: #D1FAE5; color: ${COLORS.success}; }
   .pdm-tag.complaint { background: #FEE2E2; color: ${COLORS.red}; }
+  .pdm-breakdown { margin-top: 6px; font-size: .8rem; color: ${COLORS.gray}; }
+  .pdm-aspect { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 5px 0; border-top: 1px dashed ${COLORS.border}; font-size: .82rem; }
+  .pdm-aspect:first-of-type { margin-top: 8px; }
+  .pdm-aspect b { min-width: 150px; }
+  .pdm-pill { font-size: .7rem; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
+  .pdm-pill.Praised { background: #D1FAE5; color: ${COLORS.success}; }
+  .pdm-pill.Criticised { background: #FEE2E2; color: ${COLORS.red}; }
+  .pdm-pill.Mixed, .pdm-pill.Mentioned { background: ${COLORS.warningBg}; color: ${COLORS.warning}; }
+  .pdm-quote { color: ${COLORS.gray}; font-style: italic; flex-basis: 100%; }
+  .pdm-warn { margin-top: 8px; font-size: .78rem; color: ${COLORS.warning}; background: ${COLORS.warningBg}; border-radius: 8px; padding: 6px 10px; }
   .pdm-review { border-top: 1px solid ${COLORS.border}; padding: .7rem 0; font-size: .85rem; }
   .pdm-review-stars { color: ${COLORS.gold}; font-size: .85rem; }
   .pdm-form { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
@@ -71,6 +81,7 @@ export default function ProductDetailModal({ product, onClose, onNavigate }) {
 
   useEffect(() => {
     if (!product) return;
+    apiFetch("/ai/track-view", { method: "POST", body: { product_id: product.id } }).catch(() => {}); // feeds "Picked for you"
     apiFetch(`/products/${product.id}/review-summary`, { auth: false }).then(setSummary).catch(() => {});
     apiFetch(`/products/${product.id}/reviews`, { auth: false }).then(setReviews).catch(() => {});
     apiFetch(`/products/${product.id}/similar`, { auth: false }).then(setSimilar).catch(() => {});
@@ -109,16 +120,30 @@ export default function ProductDetailModal({ product, onClose, onNavigate }) {
             </div>
           </div>
 
-          {/* AI-style review analyzer */}
-          <div className="pdm-section-title">Review summary</div>
+          {/* AI Review Insights: aspect-based summary from real review text */}
+          <div className="pdm-section-title">Review insights</div>
           <div className="pdm-summary-box">
             {summary?.count ? (
               <>
-                <span className="pdm-summary-avg">★ {summary.average}/5</span> from {summary.count} review{summary.count !== 1 ? "s" : ""}. {summary.verdict}
-                <div className="pdm-tags">
-                  {summary.praise.map((w) => <span key={w} className="pdm-tag praise">👍 {w}</span>)}
-                  {summary.complaints.map((w) => <span key={w} className="pdm-tag complaint">👎 {w}</span>)}
-                </div>
+                <span className="pdm-summary-avg">★ {summary.trusted_average ?? summary.average}/5</span> from {summary.count} review{summary.count !== 1 ? "s" : ""}. {summary.verdict}
+                {summary.aspects?.length > 0 && (
+                  <div>
+                    {summary.aspects.map((a) => (
+                      <div className="pdm-aspect" key={a.name}>
+                        <b>{a.name}</b>
+                        <span className={`pdm-pill ${a.label}`}>{a.label}</span>
+                        <span>{a.mentions} mention{a.mentions !== 1 ? "s" : ""} · 👍 {a.positive} · 👎 {a.negative}</span>
+                        {a.quote && <span className="pdm-quote">“{a.quote}”</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {summary.suspicious_count > 0 && (
+                  <div className="pdm-warn">
+                    🛡️ {summary.suspicious_count} review{summary.suspicious_count !== 1 ? "s look" : " looks"} unreliable
+                    (copied text or contact details) and {summary.suspicious_count !== 1 ? "were" : "was"} left out of the insights above.
+                  </div>
+                )}
               </>
             ) : (
               <span>{summary?.verdict || "Loading…"}</span>

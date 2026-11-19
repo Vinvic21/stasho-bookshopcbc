@@ -34,6 +34,8 @@ import MyInstallments from "./pages/MyInstallments";
 import MyOrders from "./pages/MyOrders";
 import AdminDeliveries from "./pages/AdminDeliveries";
 import Discover from "./pages/Discover";
+import Roadmap from "./pages/Roadmap";
+import AdminTrust from "./pages/AdminTrust";
 
 import { GLOBAL_STYLES } from "./theme";
 
@@ -121,6 +123,16 @@ function AppShell() {
 
       case "discover":
         return <Discover onNavigate={navigate} />;
+
+      case "roadmap":
+        return <Roadmap onNavigate={navigate} />;
+
+      case "trust":
+        return (
+          <AuthGuard requireAdmin onNavigate={navigate}>
+            <AdminTrust />
+          </AuthGuard>
+        );
 
       default:
         return (

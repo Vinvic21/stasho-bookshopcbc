@@ -1,7 +1,7 @@
-
 import { COLORS, FONTS } from "../theme";
 import { useProducts } from "../context/ProductsContext";
 import ProductCard from "../components/ProductCard";
+import ForYou from "../components/ForYou";
 
 const css = `
   .hero {
@@ -126,6 +126,9 @@ export default function Home({ onNavigate }) {
           <button className="btn-green" onClick={() => onNavigate("shop")}>View All Products →</button>
         </div>
       </div>
+
+      {/* AI picks: personalised when logged in, popular otherwise */}
+      <ForYou onNavigate={onNavigate} />
 
       {/* Features */}
       <div className="features-band">

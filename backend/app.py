@@ -9,6 +9,7 @@ from datetime import datetime
 from functools import wraps
 
 import requests
+import ai_features
 from flask import Flask, g, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from itsdangerous import URLSafeTimedSerializer, BadSignature
@@ -238,6 +239,8 @@ def init_db():
     if "delivery_status" not in existing_order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN delivery_status TEXT DEFAULT 'pending'")
         conn.commit()
+
+    ai_features.init_tables(conn)  # AI features: product_views table, resale description column
 
     if fresh:
         for name, email, password, role in SEED_USERS:
@@ -867,37 +870,8 @@ def create_review(user, product_id):
 
 @app.get("/api/products/<int:product_id>/review-summary")
 def review_summary(product_id):
-    db = get_db()
-    rows = db.execute("SELECT * FROM reviews WHERE product_id = ?", (product_id,)).fetchall()
-    if not rows:
-        return jsonify({"count": 0, "average": None, "praise": [], "complaints": [], "verdict": "No reviews yet — be the first to review this item."})
-
-    avg = sum(r["rating"] for r in rows) / len(rows)
-    praise_counts, complaint_counts = {}, {}
-    for r in rows:
-        words = re.findall(r"[a-zA-Z']+", (r["body"] or "").lower())
-        bucket = praise_counts if r["rating"] >= 4 else (complaint_counts if r["rating"] <= 2 else None)
-        for w in words:
-            if w in STOPWORDS or len(w) < 3:
-                continue
-            if bucket is not None and (w in POSITIVE_WORDS or w in NEGATIVE_WORDS or bucket is not None):
-                bucket[w] = bucket.get(w, 0) + 1
-    top_praise = sorted(praise_counts, key=praise_counts.get, reverse=True)[:5]
-    top_complaints = sorted(complaint_counts, key=complaint_counts.get, reverse=True)[:5]
-
-    if avg >= 4.5:
-        verdict = "Readers overwhelmingly love this one."
-    elif avg >= 3.5:
-        verdict = "Mostly positive feedback, with a few minor gripes."
-    elif avg >= 2.5:
-        verdict = "Mixed opinions — read a couple of reviews before buying."
-    else:
-        verdict = "Several readers reported issues with this item."
-
-    return jsonify({
-        "count": len(rows), "average": round(avg, 1),
-        "praise": top_praise, "complaints": top_complaints, "verdict": verdict,
-    })
+    # AI Review Insights: aspect-based summary built from the real review text (see ai_features.py)
+    return jsonify(ai_features.review_insights(get_db(), product_id))
 
 
 # ── 3. Hidden achievement / badge system ────────────────────────────────────
@@ -1365,10 +1339,11 @@ def create_resale_listing(user):
         return jsonify({"error": "Title and price are required."}), 400
     db = get_db()
     cur = db.execute(
-        "INSERT INTO resale_listings (seller_id, title, category, grade, condition, price, status, created_at) "
-        "VALUES (?,?,?,?,?,?, 'active', ?)",
+        "INSERT INTO resale_listings (seller_id, title, category, grade, condition, price, status, created_at, description) "
+        "VALUES (?,?,?,?,?,?, 'active', ?, ?)",
         (user["id"], data["title"], data.get("category", ""), data.get("grade", ""),
-         data.get("condition", "Good"), float(data["price"]), datetime.utcnow().isoformat()),
+         data.get("condition", "Good"), float(data["price"]), datetime.utcnow().isoformat(),
+         (data.get("description") or "")[:1000]),
     )
     db.commit()
     row = db.execute("SELECT * FROM resale_listings WHERE id = ?", (cur.lastrowid,)).fetchone()
@@ -1629,6 +1604,17 @@ def ussd():
         response = "END Invalid option."
 
     return response, 200, {"Content-Type": "text/plain"}
+
+
+ai_features.register(
+    app,
+    get_db=get_db,
+    current_user=current_user,
+    login_required=login_required,
+    admin_required=admin_required,
+    product_to_json=product_to_json,
+    parse_order_items=parse_order_items,
+)
 
 
 if __name__ == "__main__":

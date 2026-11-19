@@ -1,5 +1,5 @@
-
 import { useState, useEffect } from "react";
+import { apiFetch } from "../api";
 import { useProducts } from "../context/ProductsContext";
 import { useCart } from "../context/CartContext";
 import { useAuth } from "../context/AuthContext";
@@ -86,6 +86,22 @@ const css = `
     color: ${COLORS.gray};
     font-weight: 500;
   }
+
+  .ai-understood {
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    margin: -.6rem 0 1.2rem; font-size: .8rem; color: ${COLORS.gray};
+  }
+  .ai-chip {
+    background: ${COLORS.greenPale}; color: ${COLORS.greenDark}; border-radius: 14px;
+    padding: 3px 10px; font-weight: 600; font-size: .76rem;
+  }
+  .ai-note { margin: -.6rem 0 1.2rem; font-size: .85rem; color: ${COLORS.gray}; }
+  .ai-note button { background: none; border: none; color: ${COLORS.green}; font-weight: 700; cursor: pointer; text-decoration: underline; padding: 0 4px; }
+  .why-line { font-size: .72rem; color: ${COLORS.gray}; margin-top: 2px; }
+  .lang-btn {
+    padding: 10px 12px; border: 1.5px solid ${COLORS.border}; border-radius: 10px; background: #fff;
+    font-size: .8rem; font-weight: 700; cursor: pointer; color: ${COLORS.greenDark};
+  }
 `;
 
 export default function Shop({ onNavigate, initialFilters }) {
@@ -101,6 +117,8 @@ export default function Shop({ onNavigate, initialFilters }) {
   const [kitGrade,   setKitGrade]   = useState(initialFilters?.grade && CBC_KITS[initialFilters.grade] ? initialFilters.grade : "Grade 1");
   const [kitAdded,   setKitAdded]   = useState(false);
   const [listening,  setListening]  = useState(false);
+  const [voiceLang,  setVoiceLang]  = useState("en-KE");   // "en-KE" or "sw-KE"
+  const [ai,         setAi]         = useState(null);       // smart-search response, or null for plain browsing
   const [detailProduct, setDetailProduct] = useState(null);
 
   // Voice Search — uses the browser's built-in Web Speech API, no backend needed.
@@ -108,7 +126,7 @@ export default function Shop({ onNavigate, initialFilters }) {
   const handleVoiceSearch = () => {
     if (!SpeechRecognition) { alert("Voice search isn't supported in this browser. Try Chrome on desktop or Android."); return; }
     const recognizer = new SpeechRecognition();
-    recognizer.lang = "en-US";
+    recognizer.lang = voiceLang;
     recognizer.interimResults = false;
     recognizer.maxAlternatives = 1;
     recognizer.onstart = () => setListening(true);
@@ -124,14 +142,39 @@ export default function Shop({ onNavigate, initialFilters }) {
     if (initialFilters?.grade)     setGrade(initialFilters.grade);
   }, [initialFilters]);
 
-  const filtered = products.filter((p) => {
-    const q = search.toLowerCase();
-    return (
-      (p.title.toLowerCase().includes(q) || p.category.toLowerCase().includes(q)) &&
-      (category === "All"       || p.category === category) &&
-      (grade    === "All Grades" || p.grade === grade)
-    );
-  });
+  // AI Smart Search: understands things like "maths grade 4 under 500" or "darasa la 5 kiswahili".
+  // Falls back to the simple filter below if the server can't be reached.
+  useEffect(() => {
+    const q = search.trim();
+    if (q.length < 2) { setAi(null); return; }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      apiFetch(`/ai/search?q=${encodeURIComponent(q)}`, { auth: false })
+        .then((res) => { if (!cancelled) setAi(res); })
+        .catch(() => { if (!cancelled) setAi(null); });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [search]);
+
+  const matchesDropdowns = (p) =>
+    (category === "All" || p.category === category) &&
+    (grade === "All Grades" || p.grade === grade);
+
+  const filtered = ai
+    ? ai.results.filter(matchesDropdowns)
+    : products.filter((p) => {
+        const q = search.toLowerCase();
+        return (p.title.toLowerCase().includes(q) || p.category.toLowerCase().includes(q)) && matchesDropdowns(p);
+      });
+
+  const parsed = ai?.parsed || {};
+  const understood = [
+    parsed.grade && parsed.grade,
+    parsed.category && parsed.category,
+    parsed.set_books && "KCSE set books",
+    parsed.budget != null && `under KSh ${Number(parsed.budget).toLocaleString()}`,
+    parsed.cheapest_first && "cheapest first",
+  ].filter(Boolean);
 
   const kit = CBC_KITS[kitGrade];
   const kitItems = kit ? products.filter((p) => kit.productIds.includes(p.id)) : [];
@@ -200,7 +243,7 @@ export default function Shop({ onNavigate, initialFilters }) {
           <div className="search-wrap">
             <span className="search-icon">🔍</span>
             <input
-              placeholder="Search books, stationery…"
+              placeholder={`Try "maths grade 4 under 500" or "darasa la 5 kiswahili"`}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
@@ -213,12 +256,32 @@ export default function Shop({ onNavigate, initialFilters }) {
               >🎤</button>
             )}
           </div>
+          {SpeechRecognition && (
+            <button className="lang-btn" type="button" title="Voice search language"
+              onClick={() => setVoiceLang((l) => (l === "en-KE" ? "sw-KE" : "en-KE"))}>
+              🎤 {voiceLang === "en-KE" ? "EN" : "SW"}
+            </button>
+          )}
           <select className="filter-select" value={grade} onChange={(e) => setGrade(e.target.value)}>
             {GRADES.map((g) => <option key={g}>{g}</option>)}
           </select>
         </div>
 
-        
+        {ai && understood.length > 0 && (
+          <div className="ai-understood">
+            🧠 Understood:
+            {understood.map((u) => <span className="ai-chip" key={u}>{u}</span>)}
+          </div>
+        )}
+        {ai && ai.message && filtered.length === 0 && (
+          <div className="ai-note">
+            {ai.message}
+            {(ai.parsed?.did_you_mean || []).map((w) => (
+              <button key={w} onClick={() => setSearch(w)}>{w}?</button>
+            ))}
+          </div>
+        )}
+
         <div className="cat-chips">
           {CATEGORIES.map((c) => (
             <button

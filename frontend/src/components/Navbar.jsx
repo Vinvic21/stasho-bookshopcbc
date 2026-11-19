@@ -138,6 +138,7 @@ export default function Navbar({ currentPage, onNavigate, onCartOpen }) {
           {/* {link("savings",  "🐷 Savings")} */}
           {link("resale",   " Resell")}
           {link("discover", "Discover")}
+          {link("roadmap", "🧭 Roadmap")}
           {user && link("my-installments", " Installments")}
           {user && link("my-orders", "My Orders")}
           {link("about",    "About")}
@@ -145,6 +146,7 @@ export default function Navbar({ currentPage, onNavigate, onCartOpen }) {
           {isAdmin && link("school-admin", "Manage Schools", "admin-link")}
           {isAdmin && link("analytics", "Insights", "admin-link")}
           {isAdmin && link("deliveries", " Deliveries", "admin-link")}
+          {isAdmin && link("trust", "🛡️ Trust", "admin-link")}
         </div>
 
         <div className="nav-right">
