@@ -11,6 +11,11 @@ Seven features that run entirely on your own data (no API key, no internet):
   5. Listing Assistant     - cover-photo scan, auto-fill, description + condition suggestion
   6. Trust Shield          - risk scoring for listings, chat messages, reviews and orders
   7. Review Insights       - aspect-based review summary built from real review text
+  8. Used vs New Finder    - cheaper used copies from Resell shown on products and in the cart
+  9. Smarter School Lists  - stock checks, used copies and substitutes for any list, with a "smart mix" total
+ 10. Savings Coach         - weekly/monthly target, pace check and projected finish date for School Fund goals
+ 11. Stock Forecaster      - admin: days of stock left, reorder quantities, slow movers (term-rush aware)
+ 12. Wanted Board          - buyers post what they need; matching listings trigger alerts
 
 Optional: set ANTHROPIC_API_KEY (and optionally ANTHROPIC_MODEL) and Stasho will also use
 Claude to polish descriptions, write the roadmap coach note and judge condition from a photo.
@@ -27,7 +32,7 @@ import json
 import os
 import re
 import statistics
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import requests
 from flask import jsonify, request
@@ -189,6 +194,23 @@ def init_tables(conn):
         views INTEGER NOT NULL DEFAULT 1,
         last_at TEXT,
         PRIMARY KEY (user_id, product_id)
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS wanted_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        category TEXT DEFAULT '',
+        grade TEXT DEFAULT '',
+        max_price REAL,
+        status TEXT DEFAULT 'open',
+        notified TEXT DEFAULT '[]',
+        created_at TEXT
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS savings_plans (
+        user_id INTEGER PRIMARY KEY,
+        deadline TEXT,
+        grade TEXT DEFAULT '',
+        updated_at TEXT
     )""")
     cols = [r[1] for r in cur.execute("PRAGMA table_info(resale_listings)").fetchall()]
     if "description" not in cols:
@@ -640,6 +662,451 @@ def per_review_aspects(clause):
     return found
 
 
+def build_roadmap(db, product_to_json, grade, text, budget, extra_focus=None):
+    """Shared by the Learning Roadmap and the Savings Coach. Returns (stages, total, trimmed, gaps, tips, focus)."""
+    gnum = int(re.sub(r"\D", "", grade) or 0)
+    products = [p for p in db.execute("SELECT * FROM products WHERE stock > 0").fetchall()]
+
+    focus = []
+    for c in detect_categories(words(text)):
+        if c != "Stationery" and c not in focus:
+            focus.append(c)
+    for c in (extra_focus or []):
+        if c in CATEGORY_SYNONYMS and c != "Stationery" and c not in focus:
+            focus.append(c)
+
+    used = set()
+    stages = []
+
+    def take(items, prio):
+        out = []
+        for p in items:
+            if p["id"] in used:
+                continue
+            used.add(p["id"])
+            d = product_to_json(p)
+            d["priority"] = prio
+            out.append(d)
+        return out
+
+    core = [p for p in products if p["category"] != "Stationery" and p["grade"] == grade]
+    stages.append({"key": "core", "title": f"{grade} core books",
+                   "why": "The main textbooks for the grade.", "items": take(core, 1)})
+
+    order = (["exercise", "pencil", "eraser", "crayon", "plasticine", "drawing", "counter"] if gnum <= 3
+             else ["exercise", "pencil", "eraser", "ruler", "geometry", "coloring", "manila"])
+    stat = []
+    for kw in order:
+        hit = next((p for p in products if p["category"] == "Stationery" and kw in p["title"].lower() and p["id"] not in used
+                    and p not in stat), None)
+        if hit:
+            stat.append(hit)
+    stages.append({"key": "stationery", "title": "Daily essentials",
+                   "why": "Stationery that suits this age group.", "items": take(stat[:4], 2) + take(stat[4:], 3)})
+
+    gaps = []
+    if focus:
+        extra = []
+        for c in focus:
+            cands = [p for p in products if p["category"] == c and p["id"] not in used and p["grade"]
+                     and abs(int(re.sub(r"\D", "", p["grade"]) or 0) - gnum) <= 1]
+            cands.sort(key=lambda p: abs(int(re.sub(r"\D", "", p["grade"]) or 0) - gnum))
+            if cands:
+                extra += cands[:2]
+            else:
+                gaps.append(f"We don't have extra {c} titles near {grade} in stock yet.")
+        # a focus subject whose core book is already in stage 1 is still reflected in the plan
+        stages.append({"key": "focus", "title": f"Strengthen: {', '.join(focus)}",
+                       "why": "Extra practice or revision material in the subjects you flagged.",
+                       "items": take(extra, 2)})
+    enrich = [p for p in products if p["category"] in ("English", "Arts") and p["id"] not in used
+              and (not p["grade"] or p["grade"] == grade) and p["category"] != "Stationery"
+              and ("story" in p["title"].lower() or p["category"] == "Arts")]
+    stages.append({"key": "enrich", "title": "Reading & creativity",
+                   "why": "Story and art materials to build a reading habit.", "items": take(enrich[:2], 4)})
+    stages = [s for s in stages if s["items"]]
+
+    all_items = [i for s in stages for i in s["items"]]
+    trimmed = []
+    total = sum(i["price"] for i in all_items)
+    if budget is not None:
+        for i in sorted(all_items, key=lambda x: (-x["priority"], -x["price"])):
+            if total <= budget or i["priority"] <= 1:
+                continue
+            trimmed.append(i)
+            total -= i["price"]
+        tid = {i["id"] for i in trimmed}
+        for s in stages:
+            s["items"] = [i for i in s["items"] if i["id"] not in tid]
+        stages = [s for s in stages if s["items"]]
+    for s in stages:
+        s["subtotal"] = sum(i["price"] for i in s["items"])
+    total = sum(s["subtotal"] for s in stages)
+
+    tips = []
+    if focus:
+        tips.append(f"Short, regular practice in {', '.join(focus)} usually beats long weekend cramming.")
+    if gnum <= 3:
+        tips.append("Read aloud together for 10 to 15 minutes a day.")
+    else:
+        tips.append("Keep one exercise book per subject so revision notes stay organised.")
+    if budget is not None and trimmed:
+        tips.append(f"To stay within {money(budget)} I left out {len(trimmed)} optional item"
+                    f"{'s' if len(trimmed) != 1 else ''}; you can still add them below.")
+    if budget is not None and stages and stages[0]["key"] == "core" and stages[0]["subtotal"] > budget:
+        tips.append(f"The core books alone cost {money(stages[0]['subtotal'])}, which is above your budget. "
+                    f"Check Resell for used copies.")
+
+    return stages, total, trimmed, gaps, tips, focus
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 8/9. Used alternatives + list analysis (Used vs New Finder, Smarter School Lists)
+# ═════════════════════════════════════════════════════════════════════════════
+GENERIC_TOKENS = {"set", "pack", "sheet", "pcs", "hb", "a4", "junior", "size", "colour", "color"}
+
+
+def first_name(name):
+    return (name or "Seller").split()[0]
+
+
+def used_alternatives(db, product, exclude_seller=None, limit=3):
+    """Active resale listings that are the same book as `product`, cheaper, and not high-risk."""
+    pt = title_tokens(product["title"])
+    out = []
+    if not pt:
+        return out
+    rows = db.execute("SELECT l.*, u.name AS seller_name FROM resale_listings l "
+                      "LEFT JOIN users u ON u.id = l.seller_id WHERE l.status = 'active'").fetchall()
+    for l in rows:
+        if exclude_seller and l["seller_id"] == exclude_seller:
+            continue
+        lt = title_tokens(l["title"])
+        if not lt:
+            continue
+        if len(pt & lt) / len(pt | lt) < 0.6:
+            continue
+        if product["grade"] and l["grade"] and product["grade"].lower() != l["grade"].lower():
+            continue
+        if l["price"] >= product["price"]:
+            continue
+        trust = score_listing(db, l)
+        if trust["level"] == "high":
+            continue
+        saving = product["price"] - l["price"]
+        out.append({
+            "listing_id": l["id"], "title": l["title"], "condition": l["condition"], "price": l["price"],
+            "saving": saving, "saving_pct": int(round(100 * saving / product["price"])),
+            "seller": first_name(l["seller_name"]), "trust": trust["level"], "trust_reasons": trust["reasons"][:2],
+        })
+    out.sort(key=lambda x: (x["trust"] != "low", x["price"]))
+    return out[:limit]
+
+
+def substitutes_for(db, product, limit=2):
+    """In-stock look-alikes (same category and grade, shared keyword) for an item that is out of stock."""
+    pt = title_tokens(product["title"]) - GENERIC_TOKENS
+    out = []
+    for p in db.execute("SELECT * FROM products WHERE id != ? AND stock > 0 AND category = ?",
+                        (product["id"], product["category"])).fetchall():
+        if (p["grade"] or "") != (product["grade"] or ""):
+            continue
+        if not (pt & (title_tokens(p["title"]) - GENERIC_TOKENS)):
+            continue
+        out.append(p)
+    out.sort(key=lambda p: abs(p["price"] - product["price"]))
+    return out[:limit]
+
+
+def analyze_items(db, items, product_to_json, user_id=None):
+    """items = [{"id": product_id, "qty": n}]. Checks stock, finds used copies and look-alikes, and
+    works out a 'smart mix' total next to the all-new total."""
+    lines, total_new, total_best, unavailable = [], 0.0, 0.0, 0
+    for it in items:
+        try:
+            pid, qty = int(it["id"]), max(1, int(it.get("qty", 1)))
+        except (KeyError, TypeError, ValueError):
+            continue
+        p = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+        if not p:
+            continue
+        stock = p["stock"]
+        status = "out" if stock <= 0 else ("short" if stock < qty else ("low" if stock <= 5 else "ok"))
+        used = used_alternatives(db, p, exclude_seller=user_id, limit=2)
+        subs = substitutes_for(db, p) if status in ("out", "short") else []
+        line_new = p["price"] * qty
+
+        best = {"type": "new"}
+        line_best = line_new
+        note = ""
+        if status in ("out", "short"):
+            if used:
+                u = used[0]
+                best = {"type": "used", **u}
+                line_best = u["price"] + p["price"] * (qty - 1) if status == "short" else u["price"]
+                note = "Out of stock new, but a used copy is available." if status == "out" else "Not enough new copies; one used copy can cover the gap."
+            elif subs:
+                best = {"type": "substitute", "product": product_to_json(subs[0])}
+                line_best = subs[0]["price"] * qty
+                note = "Out of stock. Closest in-stock item shown; check it suits your list."
+            else:
+                best = {"type": "unavailable"}
+                line_best = 0
+                note = "Out of stock and no alternative found yet."
+                unavailable += 1
+        elif used and used[0]["saving_pct"] >= 20:
+            u = used[0]
+            best = {"type": "used", **u}
+            line_best = u["price"] + p["price"] * (qty - 1)
+            note = f"A {u['condition'].lower()} used copy saves {u['saving_pct']}%."
+        lines.append({
+            "product": product_to_json(p), "qty": qty, "stock_status": status,
+            "used": used, "substitutes": [product_to_json(x) for x in subs],
+            "best": best, "line_new": line_new, "line_best": line_best, "note": note,
+        })
+        total_new += line_new
+        total_best += line_best
+    return {
+        "lines": lines, "total_new": total_new, "total_best": total_best,
+        "savings": total_new - total_best if unavailable == 0 else None,
+        "unavailable": unavailable,
+        "used_count": sum(1 for l in lines if l["best"]["type"] == "used"),
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 10. Savings Coach
+# ═════════════════════════════════════════════════════════════════════════════
+def _parse_dt(s):
+    try:
+        return datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def savings_projection(db, user_id, goal, deadline, today=None):
+    today = today or date.today()
+    sav = db.execute("SELECT balance FROM savings WHERE user_id = ?", (user_id,)).fetchone()
+    balance = float(sav["balance"]) if sav else 0.0
+    remaining = max(goal - balance, 0.0)
+    days_left = (deadline - today).days
+
+    # actual saving pace from confirmed deposits in the last 60 days
+    since = today - timedelta(days=60)
+    deps = []
+    for r in db.execute("SELECT amount, created_at FROM savings_transactions WHERE user_id = ? AND status = 'paid'",
+                        (user_id,)).fetchall():
+        d = _parse_dt(r["created_at"])
+        if d and d.date() >= since:
+            deps.append((d.date(), r["amount"]))
+    pace_week = None
+    if deps:
+        first = min(d for d, _ in deps)
+        span_days = max((today - first).days, 7)
+        pace_week = sum(a for _, a in deps) / span_days * 7
+
+    status = "not_started"
+    projected = None
+    if remaining <= 0:
+        status = "reached"
+    elif days_left <= 0:
+        status = "deadline_passed"
+    elif pace_week and pace_week > 0:
+        proj_days = remaining / (pace_week / 7)
+        projected = today + timedelta(days=int(proj_days) + 1)
+        status = "on_track" if proj_days <= days_left else "behind"
+
+    weeks_left = max(days_left / 7.0, 1 / 7.0)
+    need_week = remaining / weeks_left if remaining > 0 and days_left > 0 else 0
+    need_month = remaining / max(days_left / 30.0, 1 / 30.0) if remaining > 0 and days_left > 0 else 0
+    round_up = lambda x, step: int(-(-x // step) * step)
+
+    schedule = []
+    if remaining > 0 and days_left > 0:
+        steps = min(8, max(1, int(days_left // 7)))
+        per_step = remaining / steps
+        for k in range(1, steps + 1):
+            schedule.append({"date": (today + timedelta(days=7 * k)).isoformat(),
+                             "target_balance": min(goal, round_up(balance + per_step * k, 10))})
+        schedule[-1]["target_balance"] = int(goal)
+
+    tips = []
+    if status == "reached":
+        tips.append("You've hit your goal. You can use the fund at checkout or keep saving for next term.")
+    elif status == "deadline_passed":
+        tips.append("The deadline has passed. Pick a new date and I'll recalculate.")
+    elif remaining > 0:
+        if days_left < 7:
+            tips.append(f"Less than a week left. Consider paying the remaining {money(remaining)} in one go or with Lipa Mdogo Mdogo.")
+        if status == "behind":
+            gap = need_week - (pace_week or 0)
+            tips.append(f"At your current pace you'd finish around {projected.strftime('%d %b %Y')}, after your deadline. "
+                        f"Adding about {money(round_up(max(gap, 0), 10))} a week would close the gap.")
+        if status == "on_track":
+            tips.append(f"You're on track: at your current pace you'd reach the goal around {projected.strftime('%d %b %Y')}.")
+        if days_left <= 28 and remaining > 0:
+            tips.append(f"Short on time? Lipa Mdogo Mdogo lets you split the purchase into 4 payments of about {money(round_up(remaining / 4, 10))}.")
+    return {
+        "goal": goal, "balance": balance, "remaining": remaining, "days_left": days_left,
+        "deadline": deadline.isoformat(), "status": status,
+        "weekly_needed": round_up(need_week, 10) if need_week else 0,
+        "monthly_needed": round_up(need_month, 10) if need_month else 0,
+        "pace_per_week": round(pace_week) if pace_week else None,
+        "projected_date": projected.isoformat() if projected else None,
+        "schedule": schedule, "tips": tips,
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 11. Stock forecaster
+# ═════════════════════════════════════════════════════════════════════════════
+# Approximate Kenyan school-term openings (month, day). Edit if the ministry calendar differs.
+TERM_OPENINGS = [(1, 5), (4, 28), (8, 25)]
+
+
+def next_term_opening(today):
+    cands = []
+    for yr in (today.year, today.year + 1):
+        for m, d in TERM_OPENINGS:
+            dt = date(yr, m, d)
+            if dt >= today:
+                cands.append(dt)
+    return min(cands)
+
+
+def forecast_stock(db, parse_order_items, paid_statuses, today=None):
+    today = today or date.today()
+    opening = next_term_opening(today)
+    days_to_open = (opening - today).days
+    factor = 1.8 if days_to_open <= 30 else (1.3 if days_to_open <= 60 else 1.0)
+    season = ("Term-opening rush expected" if factor == 1.8
+              else "Stock-up window before term opens" if factor == 1.3 else "No seasonal rush expected")
+
+    marks = ",".join("?" * len(paid_statuses))
+    sold14, sold60 = {}, {}
+    for o in db.execute(f"SELECT items, created_at FROM orders WHERE status IN ({marks})", paid_statuses).fetchall():
+        d = _parse_dt(o["created_at"])
+        if not d:
+            continue
+        age = (today - d.date()).days
+        for pid, qty in parse_order_items(o["items"]):
+            if age <= 60:
+                sold60[pid] = sold60.get(pid, 0) + qty
+            if age <= 14:
+                sold14[pid] = sold14.get(pid, 0) + qty
+
+    total_units_60 = sum(sold60.values())
+    enough_history = total_units_60 >= 15  # below this, "no sales" says little about a product
+    items = []
+    for p in db.execute("SELECT * FROM products").fetchall():
+        u14, u60 = sold14.get(p["id"], 0), sold60.get(p["id"], 0)
+        v = 0.6 * (u14 / 14.0) + 0.4 * (u60 / 60.0)
+        v_adj = v * factor
+        cover = (p["stock"] / v_adj) if v_adj > 0 else None
+        confidence = "high" if u60 >= 10 else ("medium" if u60 >= 3 else "low")
+        status, reason, reorder, discount = "ok", "", 0, None
+        if p["stock"] <= 0:
+            status = "out"
+            reason = "Out of stock."
+        elif cover is not None and cover < 14:
+            status = "critical"
+            reason = f"About {int(cover)} day{'s' if int(cover) != 1 else ''} of stock left at the expected pace."
+        elif cover is not None and cover < 30:
+            status = "low"
+            reason = f"About {int(cover)} days of stock left at the expected pace."
+        elif enough_history and u60 == 0 and p["stock"] >= 10:
+            status = "slow"
+            reason = f"No sales in 60 days with {p['stock']} in stock."
+            discount = "Consider 10 to 15% off or a bundle with a popular item."
+        elif enough_history and cover is not None and cover > 180:
+            status = "slow"
+            reason = f"Stock would last about {int(cover)} days, which is slow-moving."
+            discount = "Consider a small discount (about 10%) to free up cash."
+        if status in ("out", "critical", "low") and v_adj > 0:
+            need = v_adj * 59 - p["stock"]
+            reorder = int(-(-max(need, 5) // 5) * 5)
+        elif status == "out":
+            reorder = None
+            reason += " No recent sales, so restock only if you expect demand."
+        items.append({
+            "id": p["id"], "title": p["title"], "category": p["category"], "grade": p["grade"],
+            "stock": p["stock"], "sold_14d": u14, "sold_60d": u60,
+            "per_day": round(v_adj, 2), "days_cover": int(cover) if cover is not None else None,
+            "status": status, "reason": reason, "reorder_qty": reorder, "discount": discount,
+            "confidence": confidence,
+        })
+    order = {"out": 0, "critical": 1, "low": 2, "slow": 3, "ok": 4}
+    items.sort(key=lambda i: (order[i["status"]], i["days_cover"] if i["days_cover"] is not None else 9999))
+    counts = {k: sum(1 for i in items if i["status"] == k) for k in order}
+    return {
+        "as_of": today.isoformat(),
+        "season": {"label": season, "next_opening": opening.isoformat(), "days_to_opening": days_to_open, "factor": factor},
+        "assumptions": [
+            "Expected daily sales = 60% last 14 days + 40% last 60 days, multiplied by the seasonal factor.",
+            f"Next term opening is estimated as {opening.strftime('%d %b %Y')}. Edit TERM_OPENINGS in ai_features.py to match the official calendar.",
+            "Reorder quantity covers about 45 days of sales plus 14 days of safety stock.",
+            "Forecasts with few sales behind them are marked low confidence. Treat them as a hint, not a rule.",
+        ],
+        "counts": counts, "items": items,
+        "units_sold_60d": total_units_60, "enough_history": enough_history,
+        "data_note": None if enough_history else
+            f"Only {total_units_60} unit{'s' if total_units_60 != 1 else ''} sold in the last 60 days, so slow-mover checks are switched off "
+            "and forecasts are rough. They'll sharpen as orders build up.",
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 12. Wanted Board matching
+# ═════════════════════════════════════════════════════════════════════════════
+def parse_want(text):
+    g, rest = parse_grade(text)
+    b, rest = parse_budget(rest)
+    toks = [t for t in words(rest) if t not in STOP and not t.isdigit()]
+    cats = detect_categories(toks)
+    return {"grade": g or "", "max_price": b, "category": cats[0] if cats else "", "tokens": toks}
+
+
+def want_matches(db, want, limit=6):
+    parsed = parse_want(want["text"])
+    wtoks = {norm(t) for t in parsed["tokens"]} - {norm(x) for x in STOP}
+    cat = want["category"] or parsed["category"]
+    grade = want["grade"] or parsed["grade"]
+    max_price = want["max_price"] if want["max_price"] else parsed["max_price"]
+    out = []
+    rows = db.execute("SELECT l.*, u.name AS seller_name FROM resale_listings l "
+                      "LEFT JOIN users u ON u.id = l.seller_id WHERE l.status = 'active'").fetchall()
+    for l in rows:
+        if l["seller_id"] == want["user_id"]:
+            continue
+        if max_price and l["price"] > max_price:
+            continue
+        score = 0
+        if cat and (l["category"] or "").lower() == cat.lower():
+            score += 40
+        if grade and (l["grade"] or "").lower() == grade.lower():
+            score += 30
+        elif grade and l["grade"] and l["grade"].lower() != grade.lower():
+            continue
+        ltoks = title_tokens(l["title"])
+        for t in wtoks:
+            if t in ltoks:
+                score += 15
+            elif len(t) >= 5 and any(difflib.SequenceMatcher(None, t, w).ratio() >= 0.85 for w in ltoks):
+                score += 10
+        if score < 55:
+            continue
+        trust = score_listing(db, l)
+        if trust["level"] == "high":
+            continue
+        out.append({"listing_id": l["id"], "title": l["title"], "category": l["category"], "grade": l["grade"],
+                    "condition": l["condition"], "price": l["price"], "seller": first_name(l["seller_name"]),
+                    "seller_id": l["seller_id"], "score": score, "trust": trust["level"],
+                    "trust_reasons": trust["reasons"][:2]})
+    out.sort(key=lambda m: (-m["score"], m["price"]))
+    return out[:limit]
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Route registration
 # ═════════════════════════════════════════════════════════════════════════════
@@ -906,99 +1373,9 @@ def register(app, get_db, current_user, login_required, admin_required, product_
             budget = b2
         if not grade:
             return jsonify({"error": "Tell me which grade the learner is in, e.g. 'Grade 4, weak in maths, budget 3000'."}), 400
-        gnum = int(re.sub(r"\D", "", grade) or 0)
         db = get_db()
-        products = [p for p in db.execute("SELECT * FROM products WHERE stock > 0").fetchall()]
-
-        focus = []
-        for c in detect_categories(words(text)):
-            if c != "Stationery" and c not in focus:
-                focus.append(c)
-        for c in (data.get("focus") or []):
-            if c in CATEGORY_SYNONYMS and c != "Stationery" and c not in focus:
-                focus.append(c)
-
-        used = set()
-        stages = []
-
-        def take(items, prio):
-            out = []
-            for p in items:
-                if p["id"] in used:
-                    continue
-                used.add(p["id"])
-                d = product_to_json(p)
-                d["priority"] = prio
-                out.append(d)
-            return out
-
-        core = [p for p in products if p["category"] != "Stationery" and p["grade"] == grade]
-        stages.append({"key": "core", "title": f"{grade} core books",
-                       "why": "The main textbooks for the grade.", "items": take(core, 1)})
-
-        order = (["exercise", "pencil", "eraser", "crayon", "plasticine", "drawing", "counter"] if gnum <= 3
-                 else ["exercise", "pencil", "eraser", "ruler", "geometry", "coloring", "manila"])
-        stat = []
-        for kw in order:
-            hit = next((p for p in products if p["category"] == "Stationery" and kw in p["title"].lower() and p["id"] not in used
-                        and p not in stat), None)
-            if hit:
-                stat.append(hit)
-        stages.append({"key": "stationery", "title": "Daily essentials",
-                       "why": "Stationery that suits this age group.", "items": take(stat[:4], 2) + take(stat[4:], 3)})
-
-        gaps = []
-        if focus:
-            extra = []
-            for c in focus:
-                cands = [p for p in products if p["category"] == c and p["id"] not in used and p["grade"]
-                         and abs(int(re.sub(r"\D", "", p["grade"]) or 0) - gnum) <= 1]
-                cands.sort(key=lambda p: abs(int(re.sub(r"\D", "", p["grade"]) or 0) - gnum))
-                if cands:
-                    extra += cands[:2]
-                else:
-                    gaps.append(f"We don't have extra {c} titles near {grade} in stock yet.")
-            # a focus subject whose core book is already in stage 1 is still reflected in the plan
-            stages.append({"key": "focus", "title": f"Strengthen: {', '.join(focus)}",
-                           "why": "Extra practice or revision material in the subjects you flagged.",
-                           "items": take(extra, 2)})
-        enrich = [p for p in products if p["category"] in ("English", "Arts") and p["id"] not in used
-                  and (not p["grade"] or p["grade"] == grade) and p["category"] != "Stationery"
-                  and ("story" in p["title"].lower() or p["category"] == "Arts")]
-        stages.append({"key": "enrich", "title": "Reading & creativity",
-                       "why": "Story and art materials to build a reading habit.", "items": take(enrich[:2], 4)})
-        stages = [s for s in stages if s["items"]]
-
-        all_items = [i for s in stages for i in s["items"]]
-        trimmed = []
-        total = sum(i["price"] for i in all_items)
-        if budget is not None:
-            for i in sorted(all_items, key=lambda x: (-x["priority"], -x["price"])):
-                if total <= budget or i["priority"] <= 1:
-                    continue
-                trimmed.append(i)
-                total -= i["price"]
-            tid = {i["id"] for i in trimmed}
-            for s in stages:
-                s["items"] = [i for i in s["items"] if i["id"] not in tid]
-            stages = [s for s in stages if s["items"]]
-        for s in stages:
-            s["subtotal"] = sum(i["price"] for i in s["items"])
-        total = sum(s["subtotal"] for s in stages)
-
-        tips = []
-        if focus:
-            tips.append(f"Short, regular practice in {', '.join(focus)} usually beats long weekend cramming.")
-        if gnum <= 3:
-            tips.append("Read aloud together for 10 to 15 minutes a day.")
-        else:
-            tips.append("Keep one exercise book per subject so revision notes stay organised.")
-        if budget is not None and trimmed:
-            tips.append(f"To stay within {money(budget)} I left out {len(trimmed)} optional item"
-                        f"{'s' if len(trimmed) != 1 else ''}; you can still add them below.")
-        if budget is not None and stages and stages[0]["key"] == "core" and stages[0]["subtotal"] > budget:
-            tips.append(f"The core books alone cost {money(stages[0]['subtotal'])}, which is above your budget. "
-                        f"Check Resell for used copies.")
+        stages, total, trimmed, gaps, tips, focus = build_roadmap(
+            db, product_to_json, grade, text, budget, data.get("focus") or [])
 
         coach = None
         if llm_available() and stages:
@@ -1193,3 +1570,200 @@ def register(app, get_db, current_user, login_required, admin_required, product_
             "summary": {"listings": len(listings), "messages": len(messages), "reviews": len(reviews), "orders": len(orders)},
             "listings": listings, "messages": messages, "reviews": reviews, "orders": orders,
         })
+
+
+    # ── 8. Used vs New Finder ────────────────────────────────────────────────
+    @app.get("/api/ai/used-alternatives")
+    def ai_used_alternatives():
+        pid = request.args.get("product_id", type=int)
+        db = get_db()
+        p = db.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone() if pid else None
+        if not p:
+            return jsonify({"error": "Product not found."}), 404
+        user = current_user()
+        return jsonify({"new_price": p["price"],
+                        "alternatives": used_alternatives(db, p, exclude_seller=user["id"] if user else None)})
+
+    # ── 8/9. Cart and school-list analysis (stock, used copies, look-alikes) ─
+    @app.post("/api/ai/analyze-items")
+    def ai_analyze_items():
+        data = request.get_json(silent=True) or {}
+        items = data.get("items") or []
+        if not isinstance(items, list) or not items:
+            return jsonify({"error": "No items to analyse."}), 400
+        user = current_user()
+        return jsonify(analyze_items(get_db(), items[:60], product_to_json, user["id"] if user else None))
+
+    # ── 10. Savings Coach ────────────────────────────────────────────────────
+    def _coach_for(db, user, goal, deadline_str, grade):
+        try:
+            deadline = date.fromisoformat(deadline_str)
+        except (TypeError, ValueError):
+            return None, ("Pick a deadline date.", 400)
+        estimate = None
+        if grade:
+            stages, total, _tr, _gaps, _tips, _focus = build_roadmap(db, product_to_json, grade, "", None, [])
+            items = [{"id": i["id"], "qty": 1} for s_ in stages for i in s_["items"]]
+            if items:
+                an = analyze_items(db, items, product_to_json, user["id"])
+                estimate = {"grade": grade, "new_total": total, "smart_total": an["total_best"],
+                            "used_count": an["used_count"]}
+        if not goal and estimate:
+            goal = estimate["new_total"]
+        if not goal or goal <= 0:
+            return None, ("Set a goal amount, or choose a grade so I can estimate one.", 400)
+        out = savings_projection(db, user["id"], float(goal), deadline)
+        out["estimate"] = estimate
+        out["grade"] = grade
+        return out, None
+
+    @app.get("/api/ai/savings-coach")
+    @login_required
+    def ai_savings_coach_get(user):
+        db = get_db()
+        plan = db.execute("SELECT * FROM savings_plans WHERE user_id = ?", (user["id"],)).fetchone()
+        sav = db.execute("SELECT * FROM savings WHERE user_id = ?", (user["id"],)).fetchone()
+        goal = float(sav["goal_amount"]) if sav and sav["goal_amount"] else 0
+        if not plan or not plan["deadline"]:
+            return jsonify({"plan": None})
+        res, err = _coach_for(db, user, goal, plan["deadline"], plan["grade"] or "")
+        if err:
+            return jsonify({"plan": None})
+        return jsonify({"plan": res})
+
+    @app.post("/api/ai/savings-coach")
+    @login_required
+    def ai_savings_coach_post(user):
+        data = request.get_json(silent=True) or {}
+        db = get_db()
+        try:
+            goal = float(data.get("goal_amount") or 0)
+        except (TypeError, ValueError):
+            goal = 0
+        if not goal:
+            sav = db.execute("SELECT goal_amount FROM savings WHERE user_id = ?", (user["id"],)).fetchone()
+            goal = float(sav["goal_amount"]) if sav and sav["goal_amount"] else 0
+        grade = (data.get("grade") or "").strip()
+        res, err = _coach_for(db, user, goal, data.get("deadline"), grade)
+        if err:
+            return jsonify({"error": err[0]}), err[1]
+        db.execute("INSERT INTO savings_plans (user_id, deadline, grade, updated_at) VALUES (?,?,?,?) "
+                   "ON CONFLICT(user_id) DO UPDATE SET deadline = excluded.deadline, grade = excluded.grade, "
+                   "updated_at = excluded.updated_at",
+                   (user["id"], data.get("deadline"), grade, datetime.utcnow().isoformat()))
+        db.commit()
+        return jsonify({"plan": res})
+
+    # ── 11. Stock forecaster (admin) ─────────────────────────────────────────
+    @app.get("/api/ai/forecast")
+    @admin_required
+    def ai_forecast(user):
+        return jsonify(forecast_stock(get_db(), parse_order_items, PAID_STATUSES))
+
+    # ── 12. Wanted Board ─────────────────────────────────────────────────────
+    @app.post("/api/ai/wanted")
+    @login_required
+    def ai_wanted_create(user):
+        data = request.get_json(silent=True) or {}
+        text = (data.get("text") or "").strip()
+        if len(text) < 4:
+            return jsonify({"error": "Describe the book you need, e.g. 'Grade 4 Kiswahili under 300'."}), 400
+        if len(text) > 200:
+            return jsonify({"error": "Keep it under 200 characters."}), 400
+        if scan_message(text)["level"] == "high":
+            return jsonify({"error": "That text looks like a scam pattern, so I can't post it."}), 400
+        db = get_db()
+        open_n = db.execute("SELECT COUNT(*) c FROM wanted_requests WHERE user_id = ? AND status = 'open'",
+                            (user["id"],)).fetchone()["c"]
+        if open_n >= 5:
+            return jsonify({"error": "You already have 5 open requests. Close one first."}), 400
+        if db.execute("SELECT 1 FROM wanted_requests WHERE user_id = ? AND status = 'open' AND lower(text) = lower(?)",
+                      (user["id"], text)).fetchone():
+            return jsonify({"error": "You already have an open request with that text."}), 400
+        parsed = parse_want(text)
+        try:
+            max_price = float(data.get("max_price")) if data.get("max_price") not in (None, "") else parsed["max_price"]
+        except (TypeError, ValueError):
+            max_price = parsed["max_price"]
+        cur = db.execute(
+            "INSERT INTO wanted_requests (user_id, text, category, grade, max_price, status, notified, created_at) "
+            "VALUES (?,?,?,?,?, 'open', '[]', ?)",
+            (user["id"], text, parsed["category"], parsed["grade"], max_price, datetime.utcnow().isoformat()))
+        db.commit()
+        want = db.execute("SELECT * FROM wanted_requests WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return jsonify({"id": want["id"], "parsed": {"grade": want["grade"], "category": want["category"],
+                                                     "max_price": want["max_price"]},
+                        "matches": want_matches(db, want)}), 201
+
+    @app.get("/api/ai/wanted/mine")
+    @login_required
+    def ai_wanted_mine(user):
+        db = get_db()
+        out = []
+        for w in db.execute("SELECT * FROM wanted_requests WHERE user_id = ? AND status = 'open' ORDER BY id DESC",
+                            (user["id"],)).fetchall():
+            out.append({"id": w["id"], "text": w["text"], "category": w["category"], "grade": w["grade"],
+                        "max_price": w["max_price"], "created_at": w["created_at"], "matches": want_matches(db, w)})
+        return jsonify(out)
+
+    @app.get("/api/ai/wanted/board")
+    def ai_wanted_board():
+        user = current_user()
+        db = get_db()
+        out = []
+        for w in db.execute("SELECT w.*, u.name AS user_name FROM wanted_requests w LEFT JOIN users u ON u.id = w.user_id "
+                            "WHERE w.status = 'open' ORDER BY w.id DESC LIMIT 50").fetchall():
+            out.append({"id": w["id"], "text": w["text"], "category": w["category"], "grade": w["grade"],
+                        "max_price": w["max_price"], "who": first_name(w["user_name"]),
+                        "mine": bool(user and user["id"] == w["user_id"]), "created_at": w["created_at"]})
+        return jsonify(out)
+
+    @app.get("/api/ai/wanted/for-seller")
+    @login_required
+    def ai_wanted_for_seller(user):
+        """Open requests from other people that match listings this user already has up."""
+        db = get_db()
+        mine = db.execute("SELECT * FROM resale_listings WHERE seller_id = ? AND status = 'active'", (user["id"],)).fetchall()
+        out = []
+        if not mine:
+            return jsonify(out)
+        for w in db.execute("SELECT w.*, u.name AS user_name FROM wanted_requests w LEFT JOIN users u ON u.id = w.user_id "
+                            "WHERE w.status = 'open' AND w.user_id != ? ORDER BY w.id DESC LIMIT 100", (user["id"],)).fetchall():
+            hits = [m for m in want_matches(db, w, limit=20) if m["seller_id"] == user["id"]]
+            if hits:
+                out.append({"id": w["id"], "text": w["text"], "who": first_name(w["user_name"]),
+                            "max_price": w["max_price"], "your_listings": [h["title"] for h in hits[:3]]})
+        return jsonify(out)
+
+    @app.post("/api/ai/wanted/<int:want_id>/close")
+    @login_required
+    def ai_wanted_close(user, want_id):
+        data = request.get_json(silent=True) or {}
+        db = get_db()
+        w = db.execute("SELECT * FROM wanted_requests WHERE id = ?", (want_id,)).fetchone()
+        if not w or w["user_id"] != user["id"]:
+            return jsonify({"error": "Request not found."}), 404
+        db.execute("UPDATE wanted_requests SET status = ? WHERE id = ?",
+                   ("fulfilled" if data.get("fulfilled") else "closed", want_id))
+        db.commit()
+        return jsonify({"ok": True})
+
+    @app.get("/api/ai/wanted/alerts")
+    @login_required
+    def ai_wanted_alerts(user):
+        """New matches since the last check. Each listing is reported once per request."""
+        db = get_db()
+        alerts = []
+        for w in db.execute("SELECT * FROM wanted_requests WHERE user_id = ? AND status = 'open'", (user["id"],)).fetchall():
+            try:
+                seen = set(json.loads(w["notified"] or "[]"))
+            except ValueError:
+                seen = set()
+            fresh = [m for m in want_matches(db, w) if m["listing_id"] not in seen]
+            if fresh:
+                for m in fresh:
+                    alerts.append({"want_id": w["id"], "want_text": w["text"], "listing": m})
+                db.execute("UPDATE wanted_requests SET notified = ? WHERE id = ?",
+                           (json.dumps(sorted(seen | {m["listing_id"] for m in fresh})), w["id"]))
+        db.commit()
+        return jsonify(alerts)

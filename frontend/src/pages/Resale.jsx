@@ -69,6 +69,15 @@ const css = `
   .rs-warn { background: #FEF2F2; border-top: 1px solid #FECACA; padding: .7rem 1rem; font-size: .82rem; color: ${COLORS.red}; }
   .rs-warn ul { margin: .3rem 0 .5rem; padding-left: 1.1rem; }
   .rs-warn button { margin-right: 8px; padding: 6px 12px; border-radius: 8px; border: 1px solid ${COLORS.red}; background: #fff; color: ${COLORS.red}; font-size: .78rem; cursor: pointer; font-weight: 600; }
+  .rs-want-form { display: flex; gap: .6rem; flex-wrap: wrap; margin-bottom: .6rem; }
+  .rs-want-form input { flex: 1; min-width: 200px; padding: 11px 14px; border: 1.5px solid ${COLORS.border}; border-radius: 10px; font-size: .92rem; }
+  .rs-want-form input.price { flex: 0 0 150px; min-width: 120px; }
+  .rs-want { background: #fff; border: 1px solid ${COLORS.border}; border-radius: 12px; padding: 1rem 1.2rem; margin-bottom: .8rem; }
+  .rs-want-top { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; align-items: center; }
+  .rs-want-match { display: flex; justify-content: space-between; align-items: center; gap: .8rem; flex-wrap: wrap; padding: .5rem .7rem; margin-top: .5rem; background: ${COLORS.greenPale}; border-radius: 8px; font-size: .85rem; }
+  .rs-want-none { margin-top: .4rem; font-size: .82rem; color: ${COLORS.gray}; }
+  .rs-h { font-family: ${FONTS.display}; font-size: 1.1rem; margin: 1.4rem 0 .6rem; }
+  .rs-link { background: none; border: none; color: ${COLORS.gray}; cursor: pointer; font-size: .78rem; text-decoration: underline; margin-left: .6rem; }
   .rs-safety { font-size: .72rem; padding: .4rem 1rem; background: ${COLORS.warningBg}; color: ${COLORS.warning}; }
 `;
 
@@ -94,6 +103,13 @@ export default function Resale({ onNavigate }) {
   const [advice, setAdvice] = useState(null);
   const [adviceError, setAdviceError] = useState("");
   const [msgWarning, setMsgWarning] = useState(null);
+  // Wanted Board
+  const [wantText, setWantText] = useState("");
+  const [wantMax, setWantMax] = useState("");
+  const [wantError, setWantError] = useState("");
+  const [myWants, setMyWants] = useState([]);
+  const [board, setBoard] = useState([]);
+  const [demand, setDemand] = useState([]);
 
   const loadBrowse = () => {
     apiFetch("/resale", { auth: false }).then(setListings);
@@ -103,7 +119,15 @@ export default function Resale({ onNavigate }) {
   const loadThreads = () => user && apiFetch("/resale/threads").then(setThreads);
 
   useEffect(() => { loadBrowse(); }, []);
-  useEffect(() => { if (tab === "mine") loadMine(); if (tab === "messages") loadThreads(); }, [tab, user]);
+  const loadWanted = () => {
+    apiFetch("/ai/wanted/board").then(setBoard).catch(() => {});
+    if (user) {
+      apiFetch("/ai/wanted/mine").then(setMyWants).catch(() => {});
+      apiFetch("/ai/wanted/for-seller").then(setDemand).catch(() => {});
+    } else { setMyWants([]); setDemand([]); }
+  };
+
+  useEffect(() => { if (tab === "mine") loadMine(); if (tab === "messages") loadThreads(); if (tab === "wanted") loadWanted(); }, [tab, user]);
 
   const submit = async () => {
     if (!user) { onNavigate("login"); return; }
@@ -132,6 +156,23 @@ export default function Resale({ onNavigate }) {
     setTab("messages");
     await loadThreads();
     openChat(res.thread_id);
+  };
+
+  const postWant = async () => {
+    if (!user) { onNavigate("login"); return; }
+    setWantError("");
+    try {
+      await apiFetch("/ai/wanted", { method: "POST", body: { text: wantText, max_price: wantMax || null } });
+      setWantText(""); setWantMax("");
+      loadWanted();
+    } catch (e) {
+      setWantError(e.message);
+    }
+  };
+
+  const closeWant = async (id, fulfilled) => {
+    await apiFetch(`/ai/wanted/${id}/close`, { method: "POST", body: { fulfilled } });
+    loadWanted();
   };
 
   // AI Listing Assistant: scans a cover photo and/or the typed title, then fills in the form.
@@ -213,6 +254,7 @@ export default function Resale({ onNavigate }) {
         <div className="rs-tabs">
           <div className={`rs-tab ${tab === "browse" ? "active" : ""}`} onClick={() => setTab("browse")}>Browse Listings</div>
           <div className={`rs-tab ${tab === "sell" ? "active" : ""}`} onClick={() => setTab("sell")}>Sell a Book</div>
+          <div className={`rs-tab ${tab === "wanted" ? "active" : ""}`} onClick={() => setTab("wanted")}>📢 Wanted</div>
           {user && <div className={`rs-tab ${tab === "mine" ? "active" : ""}`} onClick={() => setTab("mine")}>My Listings</div>}
           {user && <div className={`rs-tab ${tab === "messages" ? "active" : ""}`} onClick={() => setTab("messages")}>Messages</div>}
         </div>
@@ -294,6 +336,69 @@ export default function Resale({ onNavigate }) {
                     {user ? "💬 Message Seller" : "🔒 Login to message seller"}
                   </button>
                 )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {tab === "wanted" && (
+          <div>
+            <div className="rs-ai">
+              <h4>📢 Can't find a book? Post what you need</h4>
+              <p>Describe it in your own words, like "Grade 4 Kiswahili under 300". When a matching listing appears, you'll get an alert.</p>
+              <div className="rs-want-form">
+                <input placeholder="What do you need?" value={wantText} onChange={(e) => setWantText(e.target.value)} maxLength={200} />
+                <input className="price" type="number" placeholder="Max price (optional)" value={wantMax} onChange={(e) => setWantMax(e.target.value)} />
+                <button className="rs-btn" onClick={postWant} disabled={wantText.trim().length < 4}>{user ? "Post request" : "🔒 Login to post"}</button>
+              </div>
+              {wantError && <div className="rs-ai-note" style={{ marginTop: 0 }}>⚠️ {wantError}</div>}
+            </div>
+
+            {user && myWants.length > 0 && (
+              <>
+                <div className="rs-h">Your requests</div>
+                {myWants.map((w) => (
+                  <div className="rs-want" key={w.id}>
+                    <div className="rs-want-top">
+                      <div><b>{w.text}</b>
+                        <div className="rs-card-meta">{[w.grade, w.category, w.max_price ? `up to KSh ${w.max_price.toLocaleString()}` : ""].filter(Boolean).join(" · ")}</div>
+                      </div>
+                      <div>
+                        <button className="rs-btn rs-btn-outline" style={{ padding: "6px 12px" }} onClick={() => closeWant(w.id, true)}>Got it ✓</button>
+                        <button className="rs-link" onClick={() => closeWant(w.id, false)}>Remove</button>
+                      </div>
+                    </div>
+                    {w.matches.length === 0 && <div className="rs-want-none">No matching listings yet. I'll alert you when one appears.</div>}
+                    {w.matches.map((m) => (
+                      <div className="rs-want-match" key={m.listing_id}>
+                        <span><b>{m.title}</b> · {m.condition} · KSh {m.price.toLocaleString()} · {m.seller}
+                          {m.trust !== "low" && <span style={{ color: COLORS.warning }}> · check details</span>}</span>
+                        <button className="rs-btn" style={{ padding: "6px 12px" }} onClick={() => messageSeller({ id: m.listing_id, seller_id: m.seller_id })}>Message seller</button>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </>
+            )}
+
+            {user && demand.length > 0 && (
+              <>
+                <div className="rs-h">Buyers looking for books like yours</div>
+                {demand.map((d) => (
+                  <div className="rs-want" key={d.id}>
+                    <b>{d.who}</b> wants: {d.text}
+                    <div className="rs-card-meta">Matches your listing{d.your_listings.length > 1 ? "s" : ""}: {d.your_listings.join(", ")}. They'll see it in their alerts.</div>
+                  </div>
+                ))}
+              </>
+            )}
+
+            <div className="rs-h">Wanted by other parents</div>
+            {board.length === 0 && <div className="rs-want-none">No open requests yet.</div>}
+            {board.map((w) => (
+              <div className="rs-want" key={w.id}>
+                <b>{w.text}</b>
+                <div className="rs-card-meta">{w.who}{w.mine ? " (you)" : ""} · {[w.grade, w.category, w.max_price ? `up to KSh ${w.max_price.toLocaleString()}` : ""].filter(Boolean).join(" · ")}</div>
               </div>
             ))}
           </div>

@@ -147,6 +147,7 @@ export default function Navbar({ currentPage, onNavigate, onCartOpen }) {
           {isAdmin && link("analytics", "Insights", "admin-link")}
           {isAdmin && link("deliveries", " Deliveries", "admin-link")}
           {isAdmin && link("trust", "🛡️ Trust", "admin-link")}
+          {isAdmin && link("forecast", "📈 Forecast", "admin-link")}
         </div>
 
         <div className="nav-right">

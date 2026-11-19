@@ -36,6 +36,8 @@ import AdminDeliveries from "./pages/AdminDeliveries";
 import Discover from "./pages/Discover";
 import Roadmap from "./pages/Roadmap";
 import AdminTrust from "./pages/AdminTrust";
+import AdminForecast from "./pages/AdminForecast";
+import WantedAlerts from "./components/WantedAlerts";
 
 import { GLOBAL_STYLES } from "./theme";
 
@@ -127,6 +129,13 @@ function AppShell() {
       case "roadmap":
         return <Roadmap onNavigate={navigate} />;
 
+      case "forecast":
+        return (
+          <AuthGuard requireAdmin onNavigate={navigate}>
+            <AdminForecast />
+          </AuthGuard>
+        );
+
       case "trust":
         return (
           <AuthGuard requireAdmin onNavigate={navigate}>
@@ -178,6 +187,9 @@ function AppShell() {
 
       {/* Real-time notification toasts — always mounted */}
       <NotificationFeed />
+
+      {/* Wanted Board: toasts when a listing matches something the user asked for */}
+      <WantedAlerts />
     </>
   );
 }

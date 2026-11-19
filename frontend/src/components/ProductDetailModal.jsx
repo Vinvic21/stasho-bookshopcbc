@@ -38,6 +38,10 @@ const css = `
   .pdm-tag { font-size: .74rem; padding: 3px 9px; border-radius: 12px; font-weight: 600; }
   .pdm-tag.praise { background: #D1FAE5; color: ${COLORS.success}; }
   .pdm-tag.complaint { background: #FEE2E2; color: ${COLORS.red}; }
+  .pdm-used { background: ${COLORS.greenPale}; border-radius: 12px; padding: .8rem 1rem; margin: 1rem 0; font-size: .85rem; }
+  .pdm-used-row { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; border-top: 1px dashed ${COLORS.border}; }
+  .pdm-used-row:first-of-type { border-top: none; }
+  .pdm-used button { margin-top: 6px; background: none; border: none; color: ${COLORS.green}; font-weight: 700; cursor: pointer; padding: 0; font-size: .82rem; }
   .pdm-breakdown { margin-top: 6px; font-size: .8rem; color: ${COLORS.gray}; }
   .pdm-aspect { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 5px 0; border-top: 1px dashed ${COLORS.border}; font-size: .82rem; }
   .pdm-aspect:first-of-type { margin-top: 8px; }
@@ -75,6 +79,7 @@ export default function ProductDetailModal({ product, onClose, onNavigate }) {
   const [summary, setSummary] = useState(null);
   const [reviews, setReviews] = useState([]);
   const [similar, setSimilar] = useState([]);
+  const [used, setUsed] = useState(null);   // cheaper used copies from Resell
   const [rating, setRating] = useState(5);
   const [body, setBody] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -85,6 +90,8 @@ export default function ProductDetailModal({ product, onClose, onNavigate }) {
     apiFetch(`/products/${product.id}/review-summary`, { auth: false }).then(setSummary).catch(() => {});
     apiFetch(`/products/${product.id}/reviews`, { auth: false }).then(setReviews).catch(() => {});
     apiFetch(`/products/${product.id}/similar`, { auth: false }).then(setSimilar).catch(() => {});
+    setUsed(null);
+    apiFetch(`/ai/used-alternatives?product_id=${product.id}`).then(setUsed).catch(() => {});
   }, [product]);
 
   if (!product) return null;
@@ -149,6 +156,20 @@ export default function ProductDetailModal({ product, onClose, onNavigate }) {
               <span>{summary?.verdict || "Loading…"}</span>
             )}
           </div>
+
+          {/* AI Used vs New Finder */}
+          {used && used.alternatives.length > 0 && (
+            <div className="pdm-used">
+              <b>♻️ Cheaper used copies on Resell</b>
+              {used.alternatives.map((a) => (
+                <div className="pdm-used-row" key={a.listing_id}>
+                  <span>{a.condition} · {a.seller}{a.trust !== "low" ? " · check details" : ""}</span>
+                  <span><b>KSh {a.price.toLocaleString()}</b> (saves {a.saving_pct}%)</span>
+                </div>
+              ))}
+              <button onClick={() => { onClose?.(); onNavigate?.("resale"); }}>See them in Resell →</button>
+            </div>
+          )}
 
           {/* Leave a review */}
           <div className="pdm-form">

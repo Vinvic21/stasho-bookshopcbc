@@ -7,6 +7,7 @@ import { useAuth } from "../context/AuthContext";
 import { useNotifications } from "../context/NotificationContext";
 import { apiFetch } from "../api";
 import { COLORS, FONTS } from "../theme";
+import UsedSaver from "../components/UsedSaver";
 
 const css = `
   /* Overlay */
@@ -308,6 +309,8 @@ export default function Cart({ isOpen, onClose, onNavigate }) {
             </div>
           ))}
         </div>
+
+        {cartItems.length > 0 && <UsedSaver cartItems={cartItems} onNavigate={onNavigate} onClose={onClose} />}
 
         {cartItems.length > 0 && (
           <div className="cart-footer">

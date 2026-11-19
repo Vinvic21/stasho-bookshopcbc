@@ -33,12 +33,22 @@ const css = `
     border-radius: 10px; font-weight: 600; cursor: pointer; font-size: .95rem;
   }
   .sl-add-btn:hover { background: ${COLORS.greenDark}; }
+  .sl-badge { display: inline-block; margin-top: 3px; padding: 2px 9px; border-radius: 10px; font-size: .72rem; font-weight: 600; }
+  .sl-badge.used { background: ${COLORS.greenPale}; color: ${COLORS.greenDark}; }
+  .sl-badge.warn { background: ${COLORS.warningBg}; color: ${COLORS.warning}; }
+  .sl-badge.bad { background: #FEE2E2; color: ${COLORS.red}; }
+  .sl-smart { border: 1.5px solid ${COLORS.green}; border-radius: 12px; padding: 1rem 1.3rem; margin-bottom: 1.2rem; background: #fff; }
+  .sl-smart h3 { font-size: 1rem; margin-bottom: .4rem; }
+  .sl-smart-row { display: flex; justify-content: space-between; font-size: .9rem; padding: 2px 0; }
+  .sl-smart-note { font-size: .78rem; color: ${COLORS.gray}; margin-top: .5rem; }
+  .sl-actions { display: flex; gap: .8rem; flex-wrap: wrap; }
+  .sl-add-btn.alt { background: #fff; color: ${COLORS.greenDark}; border: 1.5px solid ${COLORS.green}; }
   .sl-empty { text-align: center; padding: 3rem; color: ${COLORS.gray}; }
 `;
 
 export default function SchoolLists({ onNavigate }) {
   const { user } = useAuth();
-  const { replaceCart } = useCart();
+  const { replaceCart, cartItems } = useCart();
   const { notify } = useNotifications();
   const [schools, setSchools] = useState([]);
   const [schoolId, setSchoolId] = useState("");
@@ -46,6 +56,7 @@ export default function SchoolLists({ onNavigate }) {
   const [grade, setGrade] = useState("");
   const [items, setItems] = useState([]);
   const [adding, setAdding] = useState(false);
+  const [analysis, setAnalysis] = useState(null);   // AI: stock check, used copies, substitutes
 
   useEffect(() => { apiFetch("/schools", { auth: false }).then(setSchools); }, []);
 
@@ -59,7 +70,35 @@ export default function SchoolLists({ onNavigate }) {
     apiFetch(`/schools/${schoolId}/lists/${encodeURIComponent(grade)}`, { auth: false }).then(setItems);
   }, [schoolId, grade]);
 
+  // Smarter School Lists: check every item for stock, used copies and look-alikes
+  useEffect(() => {
+    if (!items.length) { setAnalysis(null); return; }
+    apiFetch("/ai/analyze-items", { method: "POST", body: { items: items.map((i) => ({ id: i.id, qty: i.qty })) } })
+      .then(setAnalysis).catch(() => setAnalysis(null));
+  }, [items]);
+
+  const lineFor = (id) => analysis?.lines.find((l) => l.product.id === id);
+
   const total = items.reduce((s, i) => s + i.price * i.qty, 0);
+
+  // Smart mix: new items (swapping in a look-alike when something is out of stock). Used copies are
+  // bought from the seller on Resell, so they're listed rather than added to the cart.
+  const handleSmartAdd = () => {
+    if (!user) { onNavigate("login"); return; }
+    const next = cartItems.map((c) => ({ ...c }));
+    let added = 0;
+    analysis.lines.forEach((l) => {
+      const b = l.best;
+      if (b.type === "used" || b.type === "unavailable") return;
+      const prod = b.type === "substitute" ? b.product : l.product;
+      const existing = next.find((c) => c.id === prod.id);
+      if (existing) existing.qty += l.qty; else next.push({ ...prod, qty: l.qty });
+      added += 1;
+    });
+    replaceCart(next);
+    notify({ type: "order", icon: "🧠", title: "Smart mix added",
+      body: `${added} item${added !== 1 ? "s" : ""} added to your cart. Used copies are on Resell.`, duration: 6500 });
+  };
 
   const handleAdd = async () => {
     if (!user) { onNavigate("login"); return; }
@@ -110,6 +149,15 @@ export default function SchoolLists({ onNavigate }) {
                     <div>
                       <div className="sl-item-title">{it.title}</div>
                       <div className="sl-item-meta">{it.category} · KSh {it.price.toLocaleString()} each</div>
+                      {(() => {
+                        const l = lineFor(it.id);
+                        if (!l) return null;
+                        if (l.stock_status === "out") return <span className="sl-badge bad">Out of stock{l.best.type === "substitute" ? `: try ${l.best.product.title}` : l.best.type === "used" ? ": used copy available" : ""}</span>;
+                        if (l.stock_status === "short") return <span className="sl-badge warn">Only {l.product.stock} left</span>;
+                        if (l.best.type === "used") return <span className="sl-badge used">♻️ Used from KSh {l.best.price.toLocaleString()} (saves {l.best.saving_pct}%)</span>;
+                        if (l.stock_status === "low") return <span className="sl-badge warn">Low stock</span>;
+                        return null;
+                      })()}
                     </div>
                   </div>
                   <div className="sl-item-qty">×{it.qty}</div>
@@ -120,9 +168,27 @@ export default function SchoolLists({ onNavigate }) {
               <span>Total for {grade}</span>
               <strong>KSh {total.toLocaleString()}</strong>
             </div>
-            <button className="sl-add-btn" onClick={handleAdd} disabled={adding}>
-              {adding ? "Adding…" : user ? "Add Full List to Cart" : "🔒 Login to add list"}
-            </button>
+            {analysis && (analysis.used_count > 0 || analysis.lines.some((l) => l.stock_status === "out" || l.stock_status === "short")) && (
+              <div className="sl-smart">
+                <h3>🧠 Smart mix</h3>
+                <div className="sl-smart-row"><span>All new</span><span>KSh {analysis.total_new.toLocaleString()}</span></div>
+                <div className="sl-smart-row"><span>With used copies and swaps</span><b>KSh {analysis.total_best.toLocaleString()}</b></div>
+                {analysis.savings > 0 && <div className="sl-smart-row" style={{ color: COLORS.success }}><span>You save</span><b>KSh {analysis.savings.toLocaleString()}</b></div>}
+                {analysis.unavailable > 0 && <div className="sl-smart-note">{analysis.unavailable} item{analysis.unavailable !== 1 ? "s are" : " is"} out of stock with no alternative yet, so the smart total leaves {analysis.unavailable !== 1 ? "them" : "it"} out.</div>}
+                <div className="sl-smart-note">Used copies come straight from other parents on Resell, so you agree the payment with the seller.</div>
+              </div>
+            )}
+            <div className="sl-actions">
+              <button className="sl-add-btn" onClick={handleAdd} disabled={adding}>
+                {adding ? "Adding…" : user ? "Add Full List to Cart" : "🔒 Login to add list"}
+              </button>
+              {analysis && (analysis.used_count > 0 || analysis.lines.some((l) => l.best.type === "substitute")) && (
+                <button className="sl-add-btn alt" onClick={handleSmartAdd}>🧠 Add smart mix</button>
+              )}
+              {analysis?.used_count > 0 && (
+                <button className="sl-add-btn alt" onClick={() => onNavigate("resale")}>♻️ See used copies</button>
+              )}
+            </div>
           </>
         )}
       </div>
