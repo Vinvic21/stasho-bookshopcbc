@@ -355,6 +355,7 @@ _mock_setting = (os.environ.get("MPESA_MOCK_MODE") or "").strip().lower()
 MPESA_MOCK_MODE = (_mock_setting == "true") if _mock_setting else not (MPESA_CONSUMER_KEY and MPESA_CONSUMER_SECRET)
 MOCK_CONFIRM_DELAY_SECONDS = int(os.environ.get("MPESA_MOCK_DELAY") or "5")
 _mock_checkouts = {}
+_stk_failures = {}  # checkout_id -> reason text from Safaricom (shown to the user)
 
 
 def normalize_phone(phone):
@@ -419,8 +420,16 @@ def initiate_stk(phone, amount, account_ref, description):
     }
     r = requests.post(
         f"{MPESA_BASE_URL}/mpesa/stkpush/v1/processrequest",
-        json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=20,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        },
+        timeout=20,
     )
+    print(f"[M-Pesa] STK push HTTP {r.status_code} -> {r.text[:400]}")
     try:
         res = r.json()
     except ValueError:
@@ -711,22 +720,35 @@ def mpesa_status(checkout_id):
 def resolve_stk_status(checkout_id, current_status, on_result, ref_label, amount):
     db = get_db()
     if current_status in ("paid", "failed"):
-        return jsonify({"status": current_status, "ref": ref_label, "total": amount})
+        out = {"status": current_status, "ref": ref_label, "total": amount}
+        if current_status == "failed":
+            out["message"] = _stk_failures.get(checkout_id) or "Payment was not completed."
+        return jsonify(out)
     try:
         res = query_stk_result(checkout_id)
     except Exception:
         return jsonify({"status": "pending", "ref": ref_label})
 
     code = str(res.get("ResultCode", ""))
+    if code:
+        print(f"[M-Pesa] STK query {checkout_id}: ResultCode={code} ResultDesc={res.get('ResultDesc')}")
     if code == "0":
         on_result("paid")
         db.commit()
         return jsonify({"status": "paid", "ref": ref_label, "total": amount})
-    if code and code != "1032":
+    still_processing = code == "1032" and checkout_id.startswith("MOCK")
+    if code and not still_processing:
+        reason = res.get("ResultDesc") or f"Payment failed (code {code})."
+        _stk_failures[checkout_id] = reason
         on_result("failed")
         db.commit()
-        return jsonify({"status": "failed", "ref": ref_label, "message": res.get("ResultDesc")})
+        return jsonify({"status": "failed", "ref": ref_label, "message": reason})
     return jsonify({"status": "pending", "ref": ref_label})
+
+
+@app.post("/api/pay/callback")
+def pay_callback_alias():
+    return mpesa_callback()
 
 
 @app.post("/api/mpesa/callback")
@@ -734,8 +756,11 @@ def mpesa_callback():
     payload = request.get_json(force=True) or {}
     stk = payload.get("Body", {}).get("stkCallback", {})
     checkout_id = stk.get("CheckoutRequestID")
+    print(f"[M-Pesa] CALLBACK {checkout_id}: ResultCode={stk.get('ResultCode')} ResultDesc={stk.get('ResultDesc')}")
     if checkout_id:
         status = "paid" if stk.get("ResultCode") == 0 else "failed"
+        if status == "failed":
+            _stk_failures[checkout_id] = stk.get("ResultDesc") or "Payment was not completed."
         db = get_db()
         pending_order = db.execute("SELECT id, items FROM orders WHERE mpesa_checkout_id=? AND status='pending'", (checkout_id,)).fetchone()
         if pending_order:
