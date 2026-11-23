@@ -5,7 +5,7 @@ import sqlite3
 import random
 import string
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 
 import requests
@@ -16,19 +16,46 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "stasho.db")
-SECRET_KEY = "stasho-dev-secret-change-me"
 
-# ── M-Pesa Daraja (sandbox) config ──────────────────────────────────────────
-# Consumer key/secret belong to your Daraja app. Shortcode/Passkey below are
-# Safaricom's shared public sandbox test values (used whenever an app's own
-# Short Code/Passkey shows "N/A") — replace with your own once Safaricom
-# issues you dedicated ones, and with production values when you go live.
-MPESA_BASE_URL = os.environ.get("MPESA_BASE_URL", "https://sandbox.safaricom.co.ke")
-MPESA_CONSUMER_KEY = os.environ.get("MPESA_CONSUMER_KEY", "6duGzrokrKmsoLW8GGKBAADnC0DoC39D5NNsY2AjG4oo4Xv2")
-MPESA_CONSUMER_SECRET = os.environ.get("MPESA_CONSUMER_SECRET", "as49cbgyvL5H0rO5ljrLNEpXTf9tvM29uIS7q8IZ77ADPLAwpEue10A3S2Ragb1n")
-MPESA_SHORTCODE = os.environ.get("MPESA_SHORTCODE", "174379")
-MPESA_PASSKEY = os.environ.get("MPESA_PASSKEY", "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919")
-MPESA_CALLBACK_URL = os.environ.get("MPESA_CALLBACK_URL", "https://example.com/api/mpesa/callback")
+
+def _load_env_file(path):
+    """Load KEY=VALUE pairs from backend/.env into the environment (real env vars win)."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(path, override=False)
+        return
+    except ImportError:
+        pass
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            val = val.split(" #", 1)[0].strip().strip('"').strip("'")
+            os.environ.setdefault(key.strip(), val)
+
+
+_load_env_file(os.path.join(BASE_DIR, ".env"))
+
+SECRET_KEY = os.environ.get("SECRET_KEY") or "stasho-dev-secret-change-me"
+
+# ── M-Pesa Daraja config (all values come from backend/.env) ────────────────
+# Sandbox:    MPESA_BASE_URL=https://sandbox.safaricom.co.ke  (STK prompts go to Safaricom's simulator,
+#             NOT to real phones)
+# Production: MPESA_BASE_URL=https://api.safaricom.co.ke      (real prompts; needs Daraja "Go Live"
+#             approval plus your own shortcode and passkey)
+MPESA_BASE_URL = (os.environ.get("MPESA_BASE_URL") or "https://sandbox.safaricom.co.ke").rstrip("/")
+MPESA_CONSUMER_KEY = (os.environ.get("MPESA_CONSUMER_KEY") or "").strip()
+MPESA_CONSUMER_SECRET = (os.environ.get("MPESA_CONSUMER_SECRET") or "").strip()
+MPESA_SHORTCODE = (os.environ.get("MPESA_SHORTCODE") or "174379").strip()
+MPESA_PASSKEY = (os.environ.get("MPESA_PASSKEY") or "").strip()
+# Paybill: CustomerPayBillOnline. Till number: CustomerBuyGoodsOnline, with MPESA_PARTY_B set to the till.
+MPESA_TRANSACTION_TYPE = (os.environ.get("MPESA_TRANSACTION_TYPE") or "CustomerPayBillOnline").strip()
+MPESA_PARTY_B = (os.environ.get("MPESA_PARTY_B") or "").strip() or MPESA_SHORTCODE
+MPESA_CALLBACK_URL = (os.environ.get("MPESA_CALLBACK_URL") or "https://example.com/api/mpesa/callback").strip()
 
 app = Flask(__name__)
 serializer = URLSafeTimedSerializer(SECRET_KEY)
@@ -321,12 +348,12 @@ def admin_required(f):
 
 
 # ── M-Pesa helpers ───────────────────────────────────────────────────────────
-# MOCK MODE: while Safaricom credentials are unresolved, set MPESA_MOCK_MODE=true
-# (it's the default) so checkout / installments / savings all work end-to-end
-# using a fake, always-succeeds STK flow instead of calling Safaricom at all.
-# Flip it to "false" once real credentials are confirmed working via curl.
-MPESA_MOCK_MODE = os.environ.get("MPESA_MOCK_MODE", "true").lower() == "true"
-MOCK_CONFIRM_DELAY_SECONDS = int(os.environ.get("MPESA_MOCK_DELAY", "5"))
+# MOCK MODE: a fake, always-succeeds STK flow so checkout, installments and savings work without Safaricom.
+# MPESA_MOCK_MODE in .env: "true" forces mock, "false" forces live, empty = automatic
+# (mock while the consumer key/secret are missing, live as soon as you add them).
+_mock_setting = (os.environ.get("MPESA_MOCK_MODE") or "").strip().lower()
+MPESA_MOCK_MODE = (_mock_setting == "true") if _mock_setting else not (MPESA_CONSUMER_KEY and MPESA_CONSUMER_SECRET)
+MOCK_CONFIRM_DELAY_SECONDS = int(os.environ.get("MPESA_MOCK_DELAY") or "5")
 _mock_checkouts = {}
 
 
@@ -341,14 +368,25 @@ def normalize_phone(phone):
     return p
 
 
+def mpesa_missing_config():
+    missing = [name for name, val in (("MPESA_CONSUMER_KEY", MPESA_CONSUMER_KEY),
+                                      ("MPESA_CONSUMER_SECRET", MPESA_CONSUMER_SECRET),
+                                      ("MPESA_PASSKEY", MPESA_PASSKEY)) if not val]
+    return missing
+
+
 def get_mpesa_token():
+    missing = mpesa_missing_config()
+    if missing:
+        raise RuntimeError("M-Pesa isn't configured yet. Add " + ", ".join(missing) + " to backend/.env and restart the server.")
     resp = requests.get(
         f"{MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials",
         auth=(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET),
         timeout=15,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"Safaricom rejected the Consumer Key/Secret ({resp.status_code}): {resp.text}")
+        raise RuntimeError(f"Safaricom rejected the Consumer Key/Secret ({resp.status_code}). Check backend/.env and that "
+                           f"MPESA_BASE_URL matches the environment the keys belong to (sandbox vs production).")
     return resp.json()["access_token"]
 
 
@@ -369,23 +407,27 @@ def initiate_stk(phone, amount, account_ref, description):
         "BusinessShortCode": MPESA_SHORTCODE,
         "Password": mpesa_password(timestamp),
         "Timestamp": timestamp,
-        "TransactionType": "CustomerPayBillOnline",
-        "Amount": int(round(amount)),
+        "TransactionType": MPESA_TRANSACTION_TYPE,
+        "Amount": max(1, int(round(amount))),
         "PartyA": phone,
-        "PartyB": MPESA_SHORTCODE,
+        "PartyB": MPESA_PARTY_B,
         "PhoneNumber": phone,
         "CallBackURL": MPESA_CALLBACK_URL,
-        "AccountReference": account_ref,
-        "TransactionDesc": description,
+        # Daraja limits: AccountReference 12 characters, TransactionDesc 13 characters
+        "AccountReference": re.sub(r"[^A-Za-z0-9]", "", str(account_ref))[:12] or "Stasho",
+        "TransactionDesc": str(description)[:13] or "Stasho",
     }
     r = requests.post(
         f"{MPESA_BASE_URL}/mpesa/stkpush/v1/processrequest",
         json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=20,
     )
-    res = r.json()
+    try:
+        res = r.json()
+    except ValueError:
+        raise RuntimeError(f"Safaricom returned an unreadable response (HTTP {r.status_code}).")
     checkout_id = res.get("CheckoutRequestID")
-    if not checkout_id:
-        raise RuntimeError(res.get("errorMessage") or res.get("ResponseDescription") or "STK push failed.")
+    if not checkout_id or str(res.get("ResponseCode", "0")) != "0":
+        raise RuntimeError(res.get("errorMessage") or res.get("CustomerMessage") or res.get("ResponseDescription") or "STK push failed.")
     return checkout_id, res.get("MerchantRequestID")
 
 
@@ -548,6 +590,7 @@ def mpesa_stkpush(user):
         return jsonify({"error": "A valid phone number and cart items are required."}), 400
 
     db = get_db()
+    expire_stale_pending_orders(db)
     total = 0
     for item in items:
         row = db.execute("SELECT * FROM products WHERE id = ?", (item["id"],)).fetchone()
@@ -586,6 +629,24 @@ def mpesa_stkpush(user):
     return jsonify({"ref": ref, "checkout_id": checkout_id, "total": total}), 201
 
 
+def release_order_stock(db, items_str):
+    """Give stock back when an order's payment fails or is abandoned."""
+    for pid, qty in parse_order_items(items_str):
+        db.execute("UPDATE products SET stock = stock + ? WHERE id = ?", (qty, pid))
+
+
+def expire_stale_pending_orders(db, minutes=10):
+    """An STK prompt lasts about a minute. Orders still 'pending' well after that were never paid, so
+    mark them failed and put their stock back."""
+    cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+    rows = db.execute("SELECT id, items FROM orders WHERE status = 'pending' AND created_at < ?", (cutoff,)).fetchall()
+    for r in rows:
+        db.execute("UPDATE orders SET status = 'failed' WHERE id = ? AND status = 'pending'", (r["id"],))
+        release_order_stock(db, r["items"])
+    if rows:
+        db.commit()
+
+
 def complete_installment_order_if_done(db, plan_id):
     remaining = db.execute(
         "SELECT COUNT(*) AS c FROM installment_payments WHERE plan_id = ? AND status != 'paid'", (plan_id,)
@@ -597,14 +658,31 @@ def complete_installment_order_if_done(db, plan_id):
             db.execute("UPDATE installment_plans SET status = 'completed' WHERE id = ?", (plan_id,))
 
 
+@app.get("/api/mpesa/config")
+def mpesa_config_check():
+    """Shows how M-Pesa is set up (never returns any key). Handy when debugging prompts."""
+    missing = mpesa_missing_config()
+    return jsonify({
+        "mode": "mock" if MPESA_MOCK_MODE else "live",
+        "environment": "sandbox" if "sandbox" in MPESA_BASE_URL else "production",
+        "base_url": MPESA_BASE_URL, "shortcode": MPESA_SHORTCODE, "transaction_type": MPESA_TRANSACTION_TYPE,
+        "missing": missing, "ready": MPESA_MOCK_MODE or not missing,
+        "callback_is_public": MPESA_CALLBACK_URL.startswith("https://") and "example.com" not in MPESA_CALLBACK_URL,
+        "note": ("Sandbox prompts go to Safaricom's simulator, not real phones." if "sandbox" in MPESA_BASE_URL and not MPESA_MOCK_MODE else ""),
+    })
+
+
 @app.get("/api/mpesa/status/<checkout_id>")
 def mpesa_status(checkout_id):
     db = get_db()
 
     order = db.execute("SELECT * FROM orders WHERE mpesa_checkout_id = ?", (checkout_id,)).fetchone()
     if order:
-        return resolve_stk_status(checkout_id, order["status"], lambda s: db.execute(
-            "UPDATE orders SET status=? WHERE id=?", (s, order["id"])), order["ref"], order["total"])
+        def on_order_result(s):
+            db.execute("UPDATE orders SET status=? WHERE id=?", (s, order["id"]))
+            if s == "failed" and order["status"] == "pending":
+                release_order_stock(db, order["items"])
+        return resolve_stk_status(checkout_id, order["status"], on_order_result, order["ref"], order["total"])
 
     inst = db.execute("SELECT * FROM installment_payments WHERE mpesa_checkout_id = ?", (checkout_id,)).fetchone()
     if inst:
@@ -659,7 +737,11 @@ def mpesa_callback():
     if checkout_id:
         status = "paid" if stk.get("ResultCode") == 0 else "failed"
         db = get_db()
-        db.execute("UPDATE orders SET status=? WHERE mpesa_checkout_id=?", (status, checkout_id))
+        pending_order = db.execute("SELECT id, items FROM orders WHERE mpesa_checkout_id=? AND status='pending'", (checkout_id,)).fetchone()
+        if pending_order:
+            db.execute("UPDATE orders SET status=? WHERE id=?", (status, pending_order["id"]))
+            if status == "failed":
+                release_order_stock(db, pending_order["items"])
         inst = db.execute("SELECT * FROM installment_payments WHERE mpesa_checkout_id=?", (checkout_id,)).fetchone()
         if inst:
             db.execute("UPDATE installment_payments SET status=?, paid_at=? WHERE id=?",
@@ -982,28 +1064,29 @@ def book_dna():
     categories = set(data.get("categories") or [])
     grade = data.get("grade") or ""
     budget = data.get("budget")
+    try:
+        budget_f = float(budget) if budget not in (None, "") else None
+    except (TypeError, ValueError):
+        budget_f = None
+    if budget_f is not None and budget_f <= 0:
+        budget_f = None
     db = get_db()
     rows = db.execute("SELECT * FROM products ORDER BY id").fetchall()
     scored = []
     for r in rows:
-        score = 0
+        # Only books the shopper can actually buy: in stock and within budget.
+        if r["stock"] <= 0:
+            continue
+        if budget_f is not None and r["price"] > budget_f:
+            continue
+        score = 10
         if categories and r["category"] in categories:
             score += 40
         if grade and r["grade"] == grade:
             score += 35
-        if budget:
-            try:
-                budget_f = float(budget)
-                if r["price"] <= budget_f:
-                    score += 15
-                else:
-                    score -= 20
-            except (TypeError, ValueError):
-                pass
-        if r["stock"] > 0:
-            score += 10
-        if score > 0:
-            scored.append((score, r))
+        if budget_f is not None:
+            score += 15
+        scored.append((score, r))
     scored.sort(key=lambda sr: sr[0], reverse=True)
     max_score = 100
     results = []
@@ -1011,7 +1094,12 @@ def book_dna():
         d = product_to_json(r)
         d["match"] = min(round(score / max_score * 100), 99) if score < max_score else 100
         results.append(d)
-    return jsonify({"profile": {"categories": list(categories), "grade": grade, "budget": budget}, "results": results})
+    message = ""
+    if not results:
+        message = (f"No book available within KSh {budget_f:,.0f}." if budget_f is not None
+                   else "No books are available right now.")
+    return jsonify({"profile": {"categories": list(categories), "grade": grade, "budget": budget},
+                    "results": results, "message": message})
 
 
 # ── 7. Mystery box surprise pick ────────────────────────────────────────────
@@ -1030,7 +1118,7 @@ def mystery_box():
         params.append(category)
     rows = db.execute(query, params).fetchall()
     if not rows:
-        return jsonify({"error": "No products match that budget/category — try widening it."}), 404
+        return jsonify({"error": "No book available for that budget" + (f" in {category}" if category and category != "All" else "") + "."}), 404
     pick = random.choice(rows)
     messages = [
         "A little surprise for your shelf! 🎁",
@@ -1619,7 +1707,16 @@ ai_features.register(
 
 if __name__ == "__main__":
     init_db()
-    print(f"M-Pesa mode: {'MOCK (simulated, no Safaricom calls)' if MPESA_MOCK_MODE else 'LIVE (real Daraja sandbox/production calls)'}")
+    if MPESA_MOCK_MODE:
+        print("M-Pesa mode: MOCK (simulated, no Safaricom calls). Add your keys to backend/.env to go live.")
+    else:
+        env = "SANDBOX (prompts go to Safaricom's simulator, not real phones)" if "sandbox" in MPESA_BASE_URL else "PRODUCTION (real prompts)"
+        print(f"M-Pesa mode: LIVE, {env}")
+        if mpesa_missing_config():
+            print("  WARNING: missing in backend/.env: " + ", ".join(mpesa_missing_config()))
+        if "example.com" in MPESA_CALLBACK_URL:
+            print("  Note: MPESA_CALLBACK_URL isn't set. Payments are still confirmed by polling Safaricom, "
+                  "but set it (e.g. an ngrok https URL) to receive callbacks.")
     app.run(debug=True, port=5000)
 else:
     init_db()

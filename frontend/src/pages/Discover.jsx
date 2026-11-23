@@ -218,6 +218,7 @@ function BookDnaPanel({ onNavigate }) {
   const [grade, setGrade] = useState("");
   const [budget, setBudget] = useState("");
   const [results, setResults] = useState(null);
+  const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
 
   const toggleCat = (c) => setCategories((prev) => prev.includes(c) ? prev.filter((x) => x !== c) : [...prev, c]);
@@ -227,6 +228,7 @@ function BookDnaPanel({ onNavigate }) {
     try {
       const data = await apiFetch("/book-dna", { method: "POST", auth: false, body: { categories, grade, budget: budget ? Number(budget) : null } });
       setResults(data.results);
+      setMessage(data.message || "");
     } finally {
       setLoading(false);
     }
@@ -247,7 +249,7 @@ function BookDnaPanel({ onNavigate }) {
           <option value="">Any grade</option>
           {GRADES.filter((g) => g !== "All Grades").map((g) => <option key={g} value={g}>{g}</option>)}
         </select>
-        <input className="quiz-input" type="number" placeholder="Budget (KSh)" value={budget} onChange={(e) => setBudget(e.target.value)} />
+        <input className="quiz-input" type="number" min="1" placeholder="Budget (KSh)" value={budget} onChange={(e) => setBudget(e.target.value)} />
         <button className="btn-green" onClick={runQuiz} disabled={loading}>{loading ? "Matching…" : "Get my matches"}</button>
       </div>
 
@@ -262,7 +264,7 @@ function BookDnaPanel({ onNavigate }) {
               <button className="add-btn" style={{ fontSize: ".72rem", padding: "5px 10px" }} onClick={() => (user ? addToCart(p) : onNavigate("login"))}>+ Add</button>
             </div>
           ))}
-          {results.length === 0 && <p style={{ color: COLORS.gray }}>No strong matches — try widening your budget or picking more subjects.</p>}
+          {results.length === 0 && <p style={{ color: COLORS.gray }}>{message || "No book available."}</p>}
         </div>
       )}
     </div>

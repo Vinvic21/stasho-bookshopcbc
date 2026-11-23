@@ -103,7 +103,7 @@ BUDGET_PATTERNS = [
     re.compile(r"(?:under|below|less than|within|max(?:imum)?|budget(?: of| is)?|up to|upto|not more than|"
                r"chini ya|isiyozidi|around|about|<)\s*(?:ksh?s?\.?|kes|shs?\.?)?\s*([\d][\d,]*)", re.I),
     re.compile(r"(?:ksh?s?\.?|kes|shs?\.?)\s*([\d][\d,]*)", re.I),
-    re.compile(r"([\d][\d,]*)\s*(?:bob|ksh|kes|shillings|/=)", re.I),
+    re.compile(r"([\d][\d,]*)\s*(?:bob|ksh|kes|shs?\b|shillings?|/=)", re.I),
 ]
 CHEAP_WORDS = {"cheap", "cheapest", "affordable", "nafuu", "lowest", "budget-friendly"}
 
@@ -131,7 +131,7 @@ def parse_budget(text):
                 val = float(m.group(1).replace(",", ""))
             except ValueError:
                 continue
-            if val >= 10:
+            if val >= 1:
                 return val, (text[:m.start()] + " " + text[m.end():])
     return None, text
 
@@ -1218,12 +1218,7 @@ def register(app, get_db, current_user, login_required, admin_required, product_
                 suggestions += difflib.get_close_matches(t, list(vocab), n=2, cutoff=0.6)
             parsed["did_you_mean"] = list(dict.fromkeys(suggestions))[:3]
             if budget is not None:
-                cheapest = None
-                cheaper = [p for p in products if (not grade or not p["grade"] or p["grade"].lower() == grade.lower())
-                           and (not cats or p["category"] in cats)]
-                if cheaper:
-                    cheapest = min(cheaper, key=lambda p: p["price"])
-                    message = f"Nothing under {money(budget)}. The closest is {cheapest['title']} at {money(cheapest['price'])}."
+                message = f"No book available within {money(budget)}."
             if not message:
                 message = "No matches. Try fewer words, or a subject and grade like 'maths grade 4'."
         return jsonify({"parsed": parsed, "results": results[:30], "message": message})

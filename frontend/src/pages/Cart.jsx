@@ -392,6 +392,7 @@ export default function Cart({ isOpen, onClose, onNavigate }) {
                   <div className="stk-phone-row">
                     <label className="form-label">M-Pesa Phone *</label>
                     <input className="form-input" placeholder="07XXXXXXXX" value={form.phone} onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))} />
+                    <div style={{ fontSize: ".75rem", color: "#6B7280", marginTop: 4 }}>The M-Pesa prompt is sent to this number. It can be your phone or someone else's.</div>
                   </div>
                   <div style={{ marginBottom:"1.25rem" }}>
                     <label className="form-label">Delivery Address</label>
